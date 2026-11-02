@@ -155,12 +155,23 @@ impl BrowserSource {
             "Navigation failed: {}",
             result["errorText"]
         );
+        let loader = result["loaderId"].as_str().map(str::to_owned);
         let deadline = Instant::now() + Duration::from_secs(45);
         let mut last_items = None;
         let mut stable_since = Instant::now();
         loop {
             thread::sleep(Duration::from_millis(750));
             // Page.navigate returns before the new document is installed. Never read old cards.
+            if let Some(expected) = &loader {
+                let frame = self.page.call("Page.getFrameTree", json!({}))?;
+                if frame["frameTree"]["frame"]["loaderId"].as_str() != Some(expected) {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "New search document did not load; no successful scan recorded"
+                    );
+                    continue;
+                }
+            }
             let current = self.page.evaluate("location.href")?;
             if current.as_str() == Some(url) {
                 let data: PageData = serde_json::from_value(self.page.evaluate(EXTRACT)?)?;
