@@ -19,13 +19,44 @@ impl Store {
                 super::sync::message_key(&value)
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(serde_json::to_string(&stable)?)
+        use sha2::Digest;
+        Ok(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&stable)?)
+        ))
     }
     pub fn draft_questions(&mut self, id: &str) -> Result<String> {
         let task = self.task()?;
         ensure!(task.approved, "Сначала подтвердите требования");
+        let excluded: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM offer_exclusions WHERE task_id=1 AND listing_id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        ensure!(!excluded, "Вариант исключён владельцем");
         let(chat,): (String,)=self.db.query_row("SELECT chat_id FROM task_offers WHERE task_id=1 AND listing_id=?1 AND chat_id IS NOT NULL",[id],|r|Ok((r.get(0)?,))).context("Нужна связь объявления с диалогом: /link")?;
-        let raw:String=self.db.query_row("SELECT assessment FROM assessments WHERE task_id=1 AND listing_id=?1 AND version=?2",params![id,task.version],|r|r.get(0)).context("Сначала выполните /analyse по актуальным требованиям")?;
+        let (raw,key):(String,String)=self.db.query_row("SELECT assessment,input_key FROM assessments WHERE task_id=1 AND listing_id=?1 AND version=?2",params![id,task.version],|r|Ok((r.get(0)?,r.get(1)?))).context("Сначала выполните /analyse по актуальным требованиям")?;
+        let context: serde_json::Value = serde_json::from_str(&key).context(
+            "Старый анализ не содержит проверенного контекста; выполните /analyse заново",
+        )?;
+        ensure!(
+            context["version"].as_u64() == Some(task.version as u64)
+                && context["chat_id"].as_str() == Some(&chat),
+            "Анализ относится к другим требованиям или диалогу; выполните /analyse заново"
+        );
+        ensure!(
+            context["history_key"].as_str() == Some(self.history_key(&chat)?.as_str()),
+            "После анализа диалог изменился; выполните /analyse заново"
+        );
+        let seller: Option<String> = self.db.query_row(
+            "SELECT seller_id FROM task_offers WHERE task_id=1 AND listing_id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            context["seller_id"].as_str() == seller.as_deref(),
+            "Изменилась привязка продавца; выполните /analyse заново"
+        );
         let assessment: Assessment = serde_json::from_str(&raw)?;
         let verdict = super::model::evaluate(&task, &assessment, now());
         ensure!(
@@ -33,10 +64,40 @@ impl Store {
             "Предложение отклонено; писать продавцу не нужно"
         );
         let history = self.history_key(&chat)?;
+        let previous_questions = {
+            let mut stmt = self
+                .db
+                .prepare("SELECT payload FROM archived_messages WHERE chat_id=?1")?;
+            let rows = stmt
+                .query_map([&chat], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .map(|raw| {
+                    let m: serde_json::Value = serde_json::from_str(&raw)?;
+                    Ok(m["body"]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_lowercase())
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         let mut questions: Vec<String> = assessment
             .questions
             .into_iter()
-            .filter(|q| !q.trim().is_empty() && !history.contains(q))
+            .filter(|q| {
+                !q.trim().is_empty()
+                    && !previous_questions.iter().any(|text| {
+                        text.contains(
+                            &q.split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .to_lowercase(),
+                        )
+                    })
+            })
             .collect();
         questions.dedup();
         ensure!(!questions.is_empty(), "Новых вопросов нет");

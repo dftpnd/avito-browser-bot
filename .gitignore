@@ -25,3 +25,5 @@ cookies*
 /export_avito.py
 
 /attachments/
+*.telegram.lock
+avito-telegram-*.lock

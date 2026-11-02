@@ -11,6 +11,8 @@ pub struct IncomingMessage {
     pub chat_id: i64,
     pub private: bool,
     pub text: String,
+    #[serde(default)]
+    pub callback_id: Option<String>,
 }
 impl IncomingMessage {
     pub fn authorized(&self, owner_id: i64) -> bool {
@@ -95,6 +97,7 @@ mod tests {
     fn only_owner_in_private_chat_is_authorized() {
         let message = IncomingMessage {
             update_id: 1,
+            callback_id: None,
             user_id: 42,
             chat_id: 42,
             private: true,
@@ -133,6 +136,31 @@ mod tests {
             "/stop junk",
         ] {
             assert!(BotCommand::parse(value).is_err(), "{value}");
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ButtonAction {
+    Callback(String),
+    Url(String),
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Button {
+    pub label: String,
+    pub action: ButtonAction,
+}
+#[derive(Debug, Clone, Default)]
+pub struct Reply {
+    pub text: String,
+    pub buttons: Vec<Vec<Button>>,
+}
+impl Reply {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            buttons: vec![],
         }
     }
 }

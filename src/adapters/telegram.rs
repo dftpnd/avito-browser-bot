@@ -87,27 +87,32 @@ impl TelegramClient {
     fn updates(&self, offset: i64, timeout: u32) -> Result<Vec<IncomingMessage>> {
         let updates = self.call(
             "getUpdates",
-            json!({"offset":offset,"timeout":timeout,"allowed_updates":["message"]}),
+            json!({"offset":offset,"timeout":timeout,"allowed_updates":["message","callback_query"]}),
         )?;
         let updates = updates
             .as_array()
             .context("Telegram updates must be an array")?;
-        Ok(updates
-            .iter()
-            .filter_map(|update| {
-                // Include unsupported updates as unauthorized empty envelopes so the offset advances.
-                Some(IncomingMessage {
-                    update_id: update["update_id"].as_i64()?,
-                    user_id: update["message"]["from"]["id"].as_i64().unwrap_or(0),
-                    chat_id: update["message"]["chat"]["id"].as_i64().unwrap_or(0),
-                    private: update["message"]["chat"]["type"] == "private",
-                    text: update["message"]["text"].as_str().unwrap_or("").to_owned(),
-                })
-            })
-            .collect())
+        Ok(updates.iter().filter_map(normalize_update).collect())
     }
 }
 impl BotTransport for TelegramClient {
+    fn answer_callback(&mut self, id: &str) -> Result<()> {
+        self.call("answerCallbackQuery", json!({"callback_query_id":id}))?;
+        Ok(())
+    }
+    fn send_reply(&mut self, chat_id: i64, reply: &crate::domain::bot::Reply) -> Result<()> {
+        if reply.buttons.is_empty() {
+            return self.send(chat_id, &reply.text);
+        }
+        ensure!(
+            reply.text.chars().count() <= 4000,
+            "Telegram message too long"
+        );
+        let keyboard = inline_keyboard(&reply.buttons)?;
+        self.call("sendMessage",json!({"chat_id":chat_id,"text":reply.text,"link_preview_options":{"is_disabled":true},"reply_markup":{"inline_keyboard":keyboard}}))?;
+        Ok(())
+    }
+
     fn receive(&mut self, offset: i64) -> Result<Vec<IncomingMessage>> {
         self.updates(offset, 20)
     }
@@ -118,5 +123,77 @@ impl BotTransport for TelegramClient {
             json!({"chat_id":chat_id,"text":text,"link_preview_options":{"is_disabled":true},"reply_markup":{"keyboard":[["📊 Сводка","✅ Подходят"],["🏆 Лучшие","💬 Диалоги"],["💰 Цены","🛠 Работа бота"],["🕒 Изменения","⚙️ Требования"],["⏸ Пауза"]],"resize_keyboard":true,"is_persistent":true}}),
         )?;
         Ok(())
+    }
+}
+
+pub(crate) fn normalize_update(update: &Value) -> Option<IncomingMessage> {
+    let callback = update.get("callback_query");
+    let message = callback
+        .map(|c| &c["message"])
+        .unwrap_or(&update["message"]);
+    let user = callback.map(|c| &c["from"]).unwrap_or(&message["from"]);
+    Some(IncomingMessage {
+        update_id: update["update_id"].as_i64()?,
+        user_id: user["id"].as_i64().unwrap_or(0),
+        chat_id: message["chat"]["id"].as_i64().unwrap_or(0),
+        private: message["chat"]["type"] == "private",
+        text: callback
+            .and_then(|c| c["data"].as_str())
+            .or_else(|| message["text"].as_str())
+            .unwrap_or("")
+            .into(),
+        callback_id: callback.and_then(|c| c["id"].as_str()).map(str::to_owned),
+    })
+}
+
+fn inline_keyboard(rows: &[Vec<crate::domain::bot::Button>]) -> Result<Vec<Vec<Value>>> {
+    use crate::domain::bot::ButtonAction;
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|button| {
+                    Ok(match &button.action {
+                        ButtonAction::Callback(data) => {
+                            ensure!(
+                                !data.is_empty() && data.len() <= 64,
+                                "Callback payload exceeds Telegram limit"
+                            );
+                            json!({"text":button.label,"callback_data":data})
+                        }
+                        ButtonAction::Url(url) => {
+                            let parsed = url::Url::parse(url)?;
+                            ensure!(
+                                parsed.scheme() == "https"
+                                    && parsed.username().is_empty()
+                                    && parsed.password().is_none(),
+                                "Button URL must be HTTPS"
+                            );
+                            json!({"text":button.label,"url":url})
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn callbacks_are_authorized_by_actual_clicker_and_private_chat() {
+        let u = json!({"update_id":1,"callback_query":{"id":"cb","from":{"id":99},"data":"ui:overview","message":{"from":{"id":42},"chat":{"id":42,"type":"private"}}}});
+        let message = normalize_update(&u).unwrap();
+        assert!(!message.authorized(42));
+        assert_eq!(message.callback_id.as_deref(), Some("cb"));
+        assert_eq!(message.user_id, 99);
+    }
+    #[test]
+    fn callback_limit_counts_bytes() {
+        use crate::domain::bot::{Button, ButtonAction};
+        let button = Button {
+            label: "test".into(),
+            action: ButtonAction::Callback("я".repeat(33)),
+        };
+        assert!(inline_keyboard(&[vec![button]]).is_err());
     }
 }

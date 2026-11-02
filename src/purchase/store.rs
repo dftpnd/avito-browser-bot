@@ -19,6 +19,8 @@ impl Store {
         let db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(10))?;
         db.execute_batch("PRAGMA foreign_keys=ON;
+   CREATE TABLE IF NOT EXISTS notification_reads(event_id INTEGER PRIMARY KEY,viewed_at INTEGER NOT NULL);
+   CREATE TABLE IF NOT EXISTS offer_exclusions(task_id INTEGER NOT NULL,listing_id TEXT NOT NULL,excluded_at INTEGER NOT NULL,PRIMARY KEY(task_id,listing_id));
    CREATE TABLE IF NOT EXISTS work_jobs(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,payload TEXT NOT NULL,priority INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',available_at INTEGER NOT NULL,created INTEGER NOT NULL,error TEXT);
    CREATE UNIQUE INDEX IF NOT EXISTS work_jobs_identity ON work_jobs(kind,payload);
    CREATE TABLE IF NOT EXISTS work_settings(key TEXT PRIMARY KEY,payload TEXT NOT NULL);
@@ -38,6 +40,8 @@ impl Store {
    CREATE TABLE IF NOT EXISTS task_offers(task_id INTEGER NOT NULL,listing_id TEXT NOT NULL,chat_id TEXT,seller_id TEXT,PRIMARY KEY(task_id,listing_id));
    CREATE TABLE IF NOT EXISTS assessments(task_id INTEGER NOT NULL,listing_id TEXT NOT NULL,version INTEGER NOT NULL,assessment TEXT NOT NULL,verdict TEXT NOT NULL,input_key TEXT NOT NULL,observed_at INTEGER NOT NULL,PRIMARY KEY(task_id,listing_id));
    CREATE TABLE IF NOT EXISTS assistant_outbox(id INTEGER PRIMARY KEY,task_id INTEGER NOT NULL,listing_id TEXT NOT NULL,text TEXT NOT NULL,delivered INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL);
+   CREATE TABLE IF NOT EXISTS notification_superseded(event_id INTEGER PRIMARY KEY,superseded_at INTEGER NOT NULL);
+   INSERT OR IGNORE INTO notification_superseded SELECT o.id,unixepoch() FROM assistant_outbox o WHERE o.delivered=0 AND EXISTS(SELECT 1 FROM assistant_outbox newer WHERE newer.task_id=o.task_id AND newer.listing_id=o.listing_id AND newer.id>o.id);
    CREATE TABLE IF NOT EXISTS model_usage(id INTEGER PRIMARY KEY,created INTEGER NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,model TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS conversation_drafts(id INTEGER PRIMARY KEY,task_id INTEGER NOT NULL,listing_id TEXT NOT NULL,chat_id TEXT NOT NULL,task_version INTEGER NOT NULL,history_key TEXT NOT NULL,text TEXT NOT NULL,status TEXT NOT NULL,created INTEGER NOT NULL);")?;
         #[cfg(unix)]
@@ -137,7 +141,35 @@ impl Store {
                 },
             );
         }
-        let verdict = super::model::evaluate(&task, &effective, now());
+        let mut verdict = super::model::evaluate(&task, &effective, now());
+        let context: serde_json::Value = serde_json::from_str(key).unwrap_or_default();
+        let linked: Option<(Option<String>, Option<String>)> = self
+            .db
+            .query_row(
+                "SELECT chat_id,seller_id FROM task_offers WHERE task_id=1 AND listing_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((Some(chat), seller)) = linked
+            && (context["chat_id"].as_str() != Some(&chat)
+                || context["history_key"].as_str() != Some(self.history_key(&chat)?.as_str())
+                || context["seller_id"].as_str() != seller.as_deref())
+        {
+            verdict.status = Status::NeedsDetails;
+            verdict.reasons =
+                vec!["Диалог или привязка продавца изменились; нужен новый анализ".into()];
+        }
+        let excluded: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM offer_exclusions WHERE task_id=1 AND listing_id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if excluded {
+            verdict.status = Status::Rejected;
+            verdict.reasons = vec!["Исключено владельцем".into()];
+        }
+
         let tx = self.db.transaction()?;
         let previous: Option<String> = tx
             .query_row(
@@ -152,6 +184,8 @@ impl Store {
             .is_some_and(|v| v.status == Status::Matched);
         tx.execute("INSERT INTO assessments VALUES(1,?1,?2,?3,?4,?5,?6) ON CONFLICT(task_id,listing_id) DO UPDATE SET version=excluded.version,assessment=excluded.assessment,verdict=excluded.verdict,input_key=excluded.input_key,observed_at=excluded.observed_at",params![id,task.version,serde_json::to_string(a)?,serde_json::to_string(&verdict)?,key,now()])?;
         if (verdict.status == Status::Matched) != was_match {
+            // Keep prior events as history, but deliver only the newest transition per offer.
+            tx.execute("INSERT OR IGNORE INTO notification_superseded SELECT id,?2 FROM assistant_outbox WHERE task_id=1 AND listing_id=?1 AND delivered=0",params![id,now()])?;
             let mut text = if verdict.status == Status::Matched {
                 format!(
                     "✅ Совпадение: предложение {id}\nГруппа приоритета: {}\n{}\n\nПодтверждения:\n{}",
@@ -198,7 +232,7 @@ impl Store {
     }
     pub fn pending(&self) -> Result<Vec<(i64, String)>> {
         let mut s = self.db.prepare(
-            "SELECT id,text FROM assistant_outbox WHERE delivered=0 ORDER BY id LIMIT 10",
+            "SELECT id,text FROM assistant_outbox WHERE delivered=0 AND NOT EXISTS(SELECT 1 FROM notification_superseded s WHERE s.event_id=assistant_outbox.id) ORDER BY id LIMIT 10",
         )?;
         Ok(s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?)
@@ -233,6 +267,67 @@ impl Store {
 mod tests {
     use super::*;
     use crate::purchase::model::{Fact, Origin};
+    #[test]
+    fn a_manual_message_removes_a_match_until_the_dialogue_is_analysed_again() {
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!("avito-stale-match-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.sqlite");
+        let base = crate::adapters::sqlite::SqliteRepository::open(&path).unwrap();
+        let mut store = Store::open(&path).unwrap();
+        let mut task = Task::gpu();
+        task.approved = true;
+        task.rules.truncate(1);
+        store.save_task(task).unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO task_offers VALUES(1,'123','chat','seller')",
+                [],
+            )
+            .unwrap();
+        store.import_records(&json!({"chats":[{"channel":{"channelId":"chat"},"messages":[{"id":"confirmed","created":now(),"fromUid":"seller","type":"text","body":{"text":"RTX PRO 6000 Blackwell в наличии"}}]}]})).unwrap();
+        let mut a = Assessment::default();
+        for (key, value) in [
+            ("model", "RTX PRO 6000 Blackwell"),
+            ("availability", "in_stock"),
+        ] {
+            a.facts.insert(
+                key.into(),
+                Fact {
+                    value: value.into(),
+                    origin: Origin::Seller,
+                    reference: "confirmed".into(),
+                    quote: "RTX PRO 6000 Blackwell в наличии".into(),
+                    observed_at: now(),
+                    contradiction: false,
+                },
+            );
+        }
+        let key=json!({"version":store.task().unwrap().version,"chat_id":"chat","seller_id":"seller","history_key":store.history_key("chat").unwrap()}).to_string();
+        assert_eq!(
+            store.record_assessment("123", &a, &key).unwrap().status,
+            Status::Matched
+        );
+        let old_event = store.pending().unwrap()[0].0;
+        store.import_records(&json!({"chats":[{"channel":{"channelId":"chat"},"messages":[{"id":"manual","created":now(),"fromUid":"buyer","type":"text","body":{"text":"Это точно не серверная версия?"}}]}]})).unwrap();
+        store.recalculate().unwrap();
+        let verdict: String = store
+            .db
+            .query_row("SELECT verdict FROM assessments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Verdict>(&verdict).unwrap().status,
+            Status::NeedsDetails
+        );
+        let pending = store.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_ne!(pending[0].0, old_event);
+        assert!(pending[0].1.contains("нужен новый анализ"));
+        drop(store);
+        drop(base);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn match_notifications_are_durable_and_not_repeated() {
         let dir = std::env::temp_dir().join(format!("avito-match-{}", std::process::id()));
@@ -284,6 +379,17 @@ mod tests {
         assert!(store.pending().unwrap().is_empty());
         a.facts.get_mut("edition").unwrap().value = "server".into();
         a.facts.get_mut("edition").unwrap().contradiction = true;
+        // An undelivered match must not be sent after a contrary fresh assessment.
+        a.facts.get_mut("edition").unwrap().value = "workstation".into();
+        a.facts.get_mut("edition").unwrap().contradiction = false;
+        store.record_assessment("456", &a, "initial").unwrap();
+        a.facts.get_mut("edition").unwrap().value = "server".into();
+        a.facts.get_mut("edition").unwrap().contradiction = true;
+        store.record_assessment("456", &a, "changed").unwrap();
+        let pending = store.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].1.contains("больше не соответствует"));
+        store.acknowledge(pending[0].0).unwrap();
         assert_eq!(
             store
                 .record_assessment("123", &a, "changed")

@@ -109,6 +109,21 @@ fn main() -> Result<()> {
                     "Set verified owner_id in local config; use telegram-setup after sending /start"
                 )
             })?;
+            let bot_id = config.token.split(':').next().expect("validated token");
+            let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    cli.database
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .into()
+                });
+            let _bot_lock = avito_browser_bot::adapters::process_lock::ProcessLock::acquire(
+                &runtime.join(format!("avito-telegram-{bot_id}.lock")),
+            )?;
+            let _database_lock = avito_browser_bot::adapters::process_lock::ProcessLock::acquire(
+                &cli.database.with_extension("telegram.lock"),
+            )?;
             let mut transport = TelegramClient::new(config.token)?;
             eprintln!("Bot: @{}", transport.check()?);
             let running = Arc::new(AtomicBool::new(true));

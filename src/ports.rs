@@ -20,6 +20,12 @@ pub trait ListingRepository {
 pub trait BotTransport {
     fn receive(&mut self, offset: i64) -> Result<Vec<crate::domain::bot::IncomingMessage>>;
     fn send(&mut self, chat_id: i64, text: &str) -> Result<()>;
+    fn send_reply(&mut self, chat_id: i64, reply: &crate::domain::bot::Reply) -> Result<()> {
+        self.send(chat_id, &reply.text)
+    }
+    fn answer_callback(&mut self, _: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait BotRepository {

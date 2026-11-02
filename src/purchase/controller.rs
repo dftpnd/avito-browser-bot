@@ -10,6 +10,19 @@ use std::path::Path;
 
 pub trait Assistant {
     fn handle(&mut self, text: &str) -> Result<Option<String>>;
+    fn reply(&mut self, text: &str) -> Result<Option<crate::domain::bot::Reply>> {
+        self.handle(text)
+            .map(|r| r.map(crate::domain::bot::Reply::text))
+    }
+    fn pending_replies(&mut self) -> Result<Vec<(i64, crate::domain::bot::Reply)>> {
+        self.pending().map(|items| {
+            items
+                .into_iter()
+                .map(|(id, text)| (id, crate::domain::bot::Reply::text(text)))
+                .collect()
+        })
+    }
+
     fn pending(&mut self) -> Result<Vec<(i64, String)>>;
     fn acknowledge(&mut self, id: i64) -> Result<()>;
     fn allows_avito(&self) -> bool {
@@ -204,6 +217,12 @@ impl Controller {
             text: super::privacy::redact(&detail),
         }];
         let linked:Option<(String,String)>=self.store.db.query_row("SELECT chat_id,seller_id FROM task_offers WHERE task_id=1 AND listing_id=?1 AND chat_id IS NOT NULL AND seller_id IS NOT NULL",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let chat_id = linked.as_ref().map(|(chat, _)| chat.clone());
+        let seller_id = linked.as_ref().map(|(_, seller)| seller.clone());
+        let history_key = chat_id
+            .as_ref()
+            .map(|chat| self.store.history_key(chat))
+            .transpose()?;
         if let Some((chat, seller)) = linked {
             let mut stmt=self.store.db.prepare("SELECT payload FROM archived_messages WHERE chat_id=?1 ORDER BY created DESC, message_id DESC")?;
             let mut rows = stmt
@@ -242,7 +261,9 @@ impl Controller {
                 <= 24000,
             "Слишком большой контекст; нужен отбор относящихся к покупке сообщений"
         );
-        let key = serde_json::to_string(&json!({"version":task.version,"sources":sources}))?;
+        let key = serde_json::to_string(
+            &json!({"version":task.version,"sources":sources,"chat_id":chat_id,"seller_id":seller_id,"history_key":history_key}),
+        )?;
         let cached:bool=self.store.db.query_row("SELECT EXISTS(SELECT 1 FROM assessments WHERE task_id=1 AND listing_id=?1 AND input_key=?2)",params![id,key],|r|r.get(0))?;
         if cached {
             self.store.recalculate()?;
@@ -282,6 +303,86 @@ impl Controller {
     }
 }
 impl Assistant for Controller {
+    fn reply(&mut self, text: &str) -> Result<Option<crate::domain::bot::Reply>> {
+        use crate::domain::bot::{Button, ButtonAction, Reply};
+        let parts = text.trim().split(':').collect::<Vec<_>>();
+        if parts.first() == Some(&"ui") {
+            let reply = match parts.as_slice() {
+                ["ui", "overview"] => self.store.dashboard()?,
+                ["ui", "list", name, page] => self
+                    .store
+                    .dashboard_list(name, page.parse().context("Неверная страница")?)?,
+                ["ui", "offer", id] => self.store.dashboard_offer(id, false)?,
+                ["ui", "proof", id] => self.store.dashboard_offer(id, true)?,
+                ["ui", "events", page] => self
+                    .store
+                    .dashboard_events(page.parse().context("Неверная страница")?)?,
+                ["ui", "seen", id] => {
+                    self.store
+                        .mark_event_seen(id.parse().context("Неверное событие")?)?;
+                    self.store.dashboard_events(0)?
+                }
+                ["ui", action @ ("exclude" | "include"), id, version] => {
+                    self.store.exclude_offer(
+                        id,
+                        version.parse().context("Неверная версия")?,
+                        *action == "exclude",
+                    )?;
+                    self.store.dashboard_offer(id, false)?
+                }
+                ["ui", "approve", version] => {
+                    ensure!(
+                        self.store.task()?.version == version.parse::<u32>()?,
+                        "Требования изменились; открой актуальную карточку"
+                    );
+                    Reply::text(
+                        self.handle("/approve")?
+                            .context("Не удалось подтвердить требования")?,
+                    )
+                }
+                _ => anyhow::bail!("Эта кнопка больше не поддерживается; открой /stats"),
+            };
+            return Ok(Some(reply));
+        }
+        let command = text.split_whitespace().next().unwrap_or("");
+        match command {
+            "/stats" | "📊" => return Ok(Some(self.store.dashboard()?)),
+            "/matches" | "✅" => return Ok(Some(self.store.dashboard_list("matched", 0)?)),
+            "/best" | "🏆" => return Ok(Some(self.store.dashboard_list("best", 0)?)),
+            "/changes" | "🕒" => return Ok(Some(self.store.dashboard_events(0)?)),
+            "/offer" | "/proof" => {
+                let id = text
+                    .split_whitespace()
+                    .nth(1)
+                    .context("Укажи ID предложения")?;
+                return Ok(Some(self.store.dashboard_offer(id, command == "/proof")?));
+            }
+            "/requirements" | "⚙️" => {
+                let task = self.store.task()?;
+                let mut reply = Reply::text(self.handle(text)?.context("Требования недоступны")?);
+                if !task.approved {
+                    reply.buttons.push(vec![Button {
+                        label: format!("Подтвердить требования v{}", task.version),
+                        action: ButtonAction::Callback(format!("ui:approve:{}", task.version)),
+                    }]);
+                }
+                reply.buttons.push(vec![Button {
+                    label: "К сводке".into(),
+                    action: ButtonAction::Callback("ui:overview".into()),
+                }]);
+                return Ok(Some(reply));
+            }
+            _ => {}
+        }
+        self.handle(text).map(|r| r.map(Reply::text))
+    }
+    fn pending_replies(&mut self) -> Result<Vec<(i64, crate::domain::bot::Reply)>> {
+        self.pending()?
+            .into_iter()
+            .map(|(id, text)| Ok((id, self.store.event_reply(id, text)?)))
+            .collect()
+    }
+
     fn allows_avito(&self) -> bool {
         self.store
             .setting("paused")
@@ -668,6 +769,18 @@ impl Controller {
         };
         let Some(lease) = lease else { return Ok(()) };
         let result = (|| -> Result<()> {
+            let listing_id = match &lease.job {
+                Job::Detail { listing_id }
+                | Job::Analyse { listing_id }
+                | Job::OpenChat { listing_id } => Some(listing_id),
+                _ => None,
+            };
+            if let Some(id) = listing_id {
+                let excluded:bool=self.store.db.query_row("SELECT EXISTS(SELECT 1 FROM offer_exclusions WHERE task_id=1 AND listing_id=?1)",[id],|r|r.get(0))?;
+                if excluded {
+                    return Ok(());
+                }
+            }
             match &lease.job {
                 Job::Attachment {
                     chat,
@@ -845,6 +958,155 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inline_navigation_is_task_scoped_and_read_marks_do_not_acknowledge_delivery() {
+        use crate::domain::bot::ButtonAction;
+        use crate::purchase::model::{Assessment, Fact};
+        let dir = std::env::temp_dir().join(format!("avito-inline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.sqlite");
+        let base = crate::adapters::sqlite::SqliteRepository::open(&db).unwrap();
+        let mut c = Controller::new(&db).unwrap();
+        let mut task = c.store.task().unwrap();
+        task.approved = true;
+        c.store.save_task(task).unwrap();
+        // A listing outside this task must not inflate the purchase counters.
+        c.store
+            .db
+            .execute("INSERT INTO listings VALUES('999','{}',0,0)", [])
+            .unwrap();
+        for id in 100..107 {
+            c.store
+                .db
+                .execute(
+                    "INSERT INTO task_offers VALUES(1,?1,NULL,'shop')",
+                    [id.to_string()],
+                )
+                .unwrap();
+            let payload=json!({"id":id.to_string(),"title":format!("RTX {id}"),"url":format!("https://www.avito.ru/moskva/kompyutery/rtx_{id}")}).to_string();
+            c.store
+                .db
+                .execute(
+                    "INSERT INTO listings VALUES(?1,?2,0,0)",
+                    params![id.to_string(), payload],
+                )
+                .unwrap();
+        }
+        let mut a = Assessment::default();
+        for rule in c.store.task().unwrap().rules {
+            a.facts.insert(
+                rule.key.clone(),
+                Fact {
+                    value: if rule.key == "edition" {
+                        "workstation".into()
+                    } else {
+                        rule.expected
+                    },
+                    origin: Origin::Seller,
+                    reference: "seller-message".into(),
+                    quote: "Есть в наличии, Workstation Edition, 96 ГБ".into(),
+                    observed_at: now(),
+                    contradiction: false,
+                },
+            );
+        }
+        a.facts.insert(
+            "availability".into(),
+            Fact {
+                value: "in_stock".into(),
+                origin: Origin::Seller,
+                reference: "seller-message".into(),
+                quote: "Есть в наличии".into(),
+                observed_at: now(),
+                contradiction: false,
+            },
+        );
+        assert_eq!(
+            c.store
+                .record_assessment("100", &a, "unlinked")
+                .unwrap()
+                .status,
+            Status::Matched
+        );
+        let stats = c.reply("📊 Сводка").unwrap().unwrap();
+        assert!(stats.text.contains("Уникальных объявлений по задаче: 7"));
+        assert!(stats.text.contains("Продавцов определено: 1"));
+        assert!(stats.text.contains("Полностью подходят: 1"));
+        assert!(stats.text.contains("Не оценены: 6"));
+        assert!(!stats.buttons.is_empty());
+        let first = c.reply("ui:list:all:0").unwrap().unwrap();
+        assert_eq!(
+            first
+                .buttons
+                .iter()
+                .flatten()
+                .filter(
+                    |b| matches!(&b.action,ButtonAction::Callback(s) if s.starts_with("ui:offer:"))
+                )
+                .count(),
+            5
+        );
+        assert!(
+            first
+                .buttons
+                .iter()
+                .flatten()
+                .any(|b| matches!(&b.action,ButtonAction::Callback(s) if s=="ui:list:all:1"))
+        );
+        let second = c.reply("ui:list:all:1").unwrap().unwrap();
+        assert_eq!(
+            second
+                .buttons
+                .iter()
+                .flatten()
+                .filter(
+                    |b| matches!(&b.action,ButtonAction::Callback(s) if s.starts_with("ui:offer:"))
+                )
+                .count(),
+            2
+        );
+        let proof = c.reply("ui:proof:100").unwrap().unwrap();
+        assert!(proof.text.contains("Есть в наличии"));
+        assert!(proof.buttons.iter().flatten().any(
+            |b| matches!(&b.action,ButtonAction::Url(s) if s.starts_with("https://www.avito.ru/"))
+        ));
+        let pending = c.store.pending().unwrap();
+        let event = pending[0].0;
+        c.reply(&format!("ui:seen:{event}")).unwrap();
+        assert_eq!(c.store.pending().unwrap().len(), 1);
+        assert!(
+            c.reply("ui:events:0")
+                .unwrap()
+                .unwrap()
+                .text
+                .contains("Просмотрено")
+        );
+        c.acknowledge(event).unwrap();
+        assert!(c.store.pending().unwrap().is_empty());
+        let version = c.store.task().unwrap().version;
+        c.reply(&format!("ui:exclude:100:{version}")).unwrap();
+        assert!(
+            c.reply("ui:list:matched:0")
+                .unwrap()
+                .unwrap()
+                .text
+                .contains("Предложения: 0")
+        );
+        assert!(
+            c.reply("ui:list:all:0")
+                .unwrap()
+                .unwrap()
+                .text
+                .contains("Предложения: 7")
+        );
+        assert!(c.reply(&format!("ui:approve:{}", version - 1)).is_err());
+        assert!(c.model.is_none());
+        assert!(c.messenger.is_none());
+        assert!(c.catalog.is_none());
+        drop(c);
+        drop(base);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn disabling_outreach_cancels_waiting_dispatches_without_sending() {
         let dir = std::env::temp_dir().join(format!("avito-outreach-off-{}", std::process::id()));

@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod attachments;
 pub mod controller;
+pub mod dashboard;
 pub mod deepseek;
 pub mod dialogue;
 pub mod jobs;

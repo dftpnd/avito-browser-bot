@@ -126,11 +126,11 @@ where
     repository.save_bot_state(&state)?;
     let mut source = None;
     while running.load(Ordering::SeqCst) {
-        match assistant.pending() {
+        match assistant.pending_replies() {
             Ok(events) => {
                 for (id, text) in events {
                     if let Err(error) = transport
-                        .send(owner_id, &text)
+                        .send_reply(owner_id, &text)
                         .and_then(|_| assistant.acknowledge(id))
                     {
                         eprintln!("Assistant notification deferred: {error}");
@@ -154,8 +154,14 @@ where
                         break;
                     }
                     if message.authorized(owner_id) && !message.text.is_empty() {
-                        let result = match assistant.handle(&message.text) {
-                            Ok(Some(reply)) => transport.send(owner_id, &reply),
+                        if let Some(callback) = &message.callback_id
+                            && let Err(error) = transport.answer_callback(callback)
+                        {
+                            eprintln!("Callback acknowledgment deferred: {error}");
+                        }
+
+                        let result = match assistant.reply(&message.text) {
+                            Ok(Some(reply)) => transport.send_reply(owner_id, &reply),
                             Err(error) => Err(error),
                             Ok(None) => BotCommand::parse(&message.text).and_then(|command| match command {
                         BotCommand::Help => transport.send(owner_id, HELP),
@@ -385,6 +391,7 @@ mod tests {
         let mut transport = transport(false);
         transport.message = Some(IncomingMessage {
             update_id: 6,
+            callback_id: None,
             user_id: 99,
             chat_id: 99,
             private: true,

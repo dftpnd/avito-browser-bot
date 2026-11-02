@@ -247,6 +247,12 @@ impl Store {
         Ok(serde_json::from_str(&raw)?)
     }
     pub fn queue_dispatch(&mut self, listing_id: &str) -> Result<i64> {
+        let excluded: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM offer_exclusions WHERE task_id=1 AND listing_id=?1)",
+            [listing_id],
+            |r| r.get(0),
+        )?;
+        ensure!(!excluded, "Предложение исключено владельцем");
         let task = self.task()?;
         ensure!(
             task.approved && !task.paused,
@@ -522,6 +528,8 @@ fn dispatch_inner(store: &mut Store, id: i64, sender: &mut impl MessageSender) -
         |r| r.get(0),
     )?;
     ensure!(draft_status == "draft", "Draft no longer valid");
+    let excluded:bool=store.db.query_row("SELECT EXISTS(SELECT 1 FROM offer_exclusions e JOIN conversation_drafts d ON d.listing_id=e.listing_id AND d.task_id=e.task_id WHERE d.id=?1)",[draft],|r|r.get(0))?;
+    ensure!(!excluded, "Предложение исключено владельцем");
     let head = store.history_head(&chat)?;
     let expected_head = head.iter().map(message_key).collect::<Result<Vec<_>>>()?;
     let tx = store
@@ -702,7 +710,8 @@ mod tests {
                 questions: vec!["Какая версия карты?".into()],
                 ..Assessment::default()
             };
-            store.record_assessment("123", &a, "key").unwrap();
+            let key=json!({"version":store.task().unwrap().version,"chat_id":"chat","seller_id":"seller","history_key":store.history_key("chat").unwrap()}).to_string();
+            store.record_assessment("123", &a, &key).unwrap();
             store.draft_questions("123").unwrap();
             Self { store, path }
         }
@@ -830,6 +839,53 @@ mod tests {
             "outdated"
         );
         assert_eq!(f.store.count("archived_messages").unwrap(), 2);
+    }
+    #[test]
+    fn manual_message_and_requirement_change_require_a_new_question_analysis() {
+        let mut f = Fixture::new("fresh-analysis");
+        f.store.import_records(&json!({"chats":[{"channel":{"channelId":"chat"},"messages":[{"id":"manual-new","created":now(),"type":"text","fromUid":"buyer","body":{"text":"Какой срок доставки?"}}]}]})).unwrap();
+        assert!(f.store.draft_questions("123").is_err());
+
+        let a = Assessment {
+            questions: vec!["Какой срок доставки?".into(), "Какая версия карты?".into()],
+            ..Assessment::default()
+        };
+        let key=json!({"version":f.store.task().unwrap().version,"chat_id":"chat","seller_id":"seller","history_key":f.store.history_key("chat").unwrap()}).to_string();
+        f.store.record_assessment("123", &a, &key).unwrap();
+        let draft = f.store.draft_questions("123").unwrap();
+        assert!(!draft.contains("Какой срок доставки?"));
+        assert!(draft.contains("Какая версия карты?"));
+
+        f.store.save_task(f.store.task().unwrap()).unwrap();
+        // Recalculating the verdict must not make an old model analysis current.
+        f.store.recalculate().unwrap();
+        assert!(f.store.draft_questions("123").is_err());
+    }
+    #[test]
+    fn excluding_an_offer_cancels_queued_sending_and_blocks_new_drafts() {
+        let mut f = Fixture::new("exclude");
+        let outgoing = f.store.queue_dispatch("123").unwrap();
+        let version = f.store.task().unwrap().version;
+        f.store.exclude_offer("123", version, true).unwrap();
+        let status: String = f
+            .store
+            .db
+            .query_row(
+                "SELECT status FROM work_jobs WHERE kind='dispatch'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        assert!(f.store.draft_questions("123").is_err());
+        let mut sender = Sender {
+            calls: 0,
+            changed: false,
+            fail: false,
+        };
+        assert!(perform_dispatch(&mut f.store, outgoing, &mut sender).is_err());
+        assert_eq!(sender.calls, 0);
+        assert!(f.store.exclude_offer("123", version - 1, false).is_err());
     }
     #[test]
     fn changing_requirements_invalidates_the_queued_message() {
