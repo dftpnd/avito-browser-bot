@@ -149,6 +149,7 @@ impl BrowserSource {
     }
 
     fn load(&mut self, url: &str) -> Result<PageData> {
+        crate::adapters::network::require_direct()?;
         let result = self.page.call("Page.navigate", json!({"url":url}))?;
         ensure!(
             result.get("errorText").is_none(),
@@ -285,6 +286,33 @@ fn verify_profile() -> Result<()> {
         "Expected Snap Chromium profile is not running. Start it using README.md; the bot will not substitute another browser"
     );
     Ok(())
+}
+
+impl BrowserSource {
+    pub fn describe(&mut self, listing: &Listing) -> Result<Value> {
+        crate::adapters::network::require_direct()?;
+        listing.validate()?;
+        let result = self
+            .page
+            .call("Page.navigate", json!({"url":listing.url}))?;
+        ensure!(result.get("errorText").is_none(), "Cannot load listing");
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            thread::sleep(Duration::from_secs(1));
+            let result=self.page.evaluate(r#"(()=>{const body=document.body?.innerText||'';if(/доступ ограничен|подтвердите, что вы не робот|captcha/i.test(body+' '+document.title))return {blocked:true};const node=document.querySelector('[data-marker="item-view/item-description"], [itemprop="description"]');return {url:location.href,description:node?.innerText||'',title:document.querySelector('h1')?.innerText||'',ready:!!node}})()"#)?;
+            ensure!(
+                result["blocked"] != true,
+                "Авито ограничил доступ; требуется ручная проверка"
+            );
+            if result["ready"] == true && result["url"].as_str() == Some(&listing.url) {
+                return Ok(result);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "Listing description unavailable; no details recorded"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

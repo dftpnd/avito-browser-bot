@@ -32,6 +32,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Импорт полной доступной локальной истории переписки в SQLite
+    ImportChats { path: PathBuf },
+    /// Проверка прямого сетевого пути к Авито, без запросов к площадке
+    NetworkCheck,
+    /// Резервная копия SQLite с проверкой целостности
+    Backup { output: PathBuf },
     /// Telegram-бот: команды и уведомления только владельцу
     Telegram {
         #[arg(long, default_value = "config.local.json")]
@@ -74,6 +80,18 @@ fn main() -> Result<()> {
     };
     let mut repository = SqliteRepository::open(&cli.database)?;
     match cli.command {
+        Command::ImportChats { path } => {
+            let mut store = avito_browser_bot::purchase::store::Store::open(&cli.database)?;
+            println!("{}", serde_json::to_string(&store.import_archive(&path)?)?);
+        }
+        Command::NetworkCheck => println!(
+            "{}",
+            serde_json::to_string_pretty(&avito_browser_bot::adapters::network::audit()?)?
+        ),
+        Command::Backup { output } => {
+            avito_browser_bot::purchase::store::Store::open(&cli.database)?.backup(&output)?;
+            println!("Backup verified: {}", output.display());
+        }
         Command::TelegramSetup { config } => {
             let config = TelegramConfig::load(&config)?;
             let transport = TelegramClient::new(config.token)?;
@@ -98,12 +116,15 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 signal.store(false, Ordering::SeqCst);
             })?;
-            avito_browser_bot::bot::run(
+            let mut assistant =
+                avito_browser_bot::purchase::controller::Controller::new(&cli.database)?;
+            avito_browser_bot::bot::run_with_assistant(
                 &mut transport,
                 &mut repository,
                 owner_id,
-                || BrowserSource::connect(Duration::from_secs(5)),
+                || BrowserSource::connect(Duration::from_secs(20)),
                 running,
+                &mut assistant,
             )?;
         }
         Command::List => println!("{}", serde_json::to_string_pretty(&repository.listings()?)?),
@@ -126,7 +147,7 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 signal.store(false, Ordering::SeqCst);
             })?;
-            let mut source = BrowserSource::connect(Duration::from_secs(5))?;
+            let mut source = BrowserSource::connect(Duration::from_secs(20))?;
             loop {
                 if !running.load(Ordering::SeqCst) {
                     break;

@@ -115,7 +115,7 @@ impl BotTransport for TelegramClient {
         ensure!(text.chars().count() <= 4000, "Telegram message too long");
         self.call(
             "sendMessage",
-            json!({"chat_id":chat_id,"text":text,"link_preview_options":{"is_disabled":true}}),
+            json!({"chat_id":chat_id,"text":text,"link_preview_options":{"is_disabled":true},"reply_markup":{"keyboard":[["📊 Сводка","✅ Подходят"],["🏆 Лучшие","💬 Диалоги"],["💰 Цены","🛠 Работа бота"],["🕒 Изменения","⚙️ Требования"],["⏸ Пауза"]],"resize_keyboard":true,"is_persistent":true}}),
         )?;
         Ok(())
     }

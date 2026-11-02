@@ -2,7 +2,7 @@ use crate::domain::SearchUrl;
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-pub const HELP: &str = "Бот поиска объявлений Авито.\n\n/scan ССЫЛКА [страницы] — один проход\n/watch ССЫЛКА [интервал_сек] [страницы] — мониторинг\n/stop — остановить мониторинг\n/status — состояние\n/help — помощь\n\nПо умолчанию: 1 страница, интервал 300 секунд. Первый проход уведомляет обо всех впервые найденных объявлениях. Свои фильтры добавим позже.";
+pub const HELP: &str = "Бот поиска объявлений Авито.\n\n/scan ССЫЛКА [страницы] — один проход\n/watch ССЫЛКА [интервал_сек] [страницы] — мониторинг\n/stop — остановить мониторинг\n/status — состояние\n/help — помощь\n\nПо умолчанию: 1 страница, интервал 300 секунд. Первый проход уведомляет обо всех впервые найденных объявлениях. /stats — статистика\n/requirements — требования\n/task текст — изменить требования\n/approve — подтвердить требования\n/card ID — подробная карточка\n/analyse ID — анализ DeepSeek\n/network — маршрут Авито\n\nСтатистика доступна кнопками.";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IncomingMessage {
@@ -55,11 +55,11 @@ impl BotCommand {
                 })
             }
             "/watch" if (2..=4).contains(&args.len()) => {
-                let interval = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(300);
+                let interval = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(1800);
                 let pages = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(1);
                 ensure!(
-                    (60..=86400).contains(&interval),
-                    "Интервал: от 60 до 86400 секунд"
+                    (1800..=86400).contains(&interval),
+                    "Интервал: от 1800 до 86400 секунд"
                 );
                 ensure!((1..=10).contains(&pages), "Число страниц: от 1 до 10");
                 Ok(Self::Watch {
@@ -119,7 +119,7 @@ mod tests {
             BotCommand::parse("/watch https://avito.ru/moskva").unwrap(),
             BotCommand::Watch {
                 pages: 1,
-                interval: 300,
+                interval: 1800,
                 ..
             }
         ));

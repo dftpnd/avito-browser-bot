@@ -77,8 +77,31 @@ pub fn run<T, R, S>(
     transport: &mut T,
     repository: &mut R,
     owner_id: i64,
+    make_source: impl FnMut() -> Result<S>,
+    running: Arc<AtomicBool>,
+) -> Result<()>
+where
+    T: BotTransport,
+    R: ListingRepository + BotRepository,
+    S: ListingSource,
+{
+    run_with_assistant(
+        transport,
+        repository,
+        owner_id,
+        make_source,
+        running,
+        &mut crate::purchase::controller::NoAssistant,
+    )
+}
+
+pub fn run_with_assistant<T, R, S>(
+    transport: &mut T,
+    repository: &mut R,
+    owner_id: i64,
     mut make_source: impl FnMut() -> Result<S>,
     running: Arc<AtomicBool>,
+    assistant: &mut impl crate::purchase::controller::Assistant,
 ) -> Result<()>
 where
     T: BotTransport,
@@ -103,6 +126,22 @@ where
     repository.save_bot_state(&state)?;
     let mut source = None;
     while running.load(Ordering::SeqCst) {
+        match assistant.pending() {
+            Ok(events) => {
+                for (id, text) in events {
+                    if let Err(error) = transport
+                        .send(owner_id, &text)
+                        .and_then(|_| assistant.acknowledge(id))
+                    {
+                        eprintln!("Assistant notification deferred: {error}");
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1100));
+                }
+            }
+            Err(error) => eprintln!("Assistant notifications unavailable: {error}"),
+        }
+
         if let Err(error) = deliver_pending(transport, repository, &mut state) {
             eprintln!("Notification delivery failed; retrying: {error}");
             pause(&running, 5);
@@ -115,7 +154,10 @@ where
                         break;
                     }
                     if message.authorized(owner_id) && !message.text.is_empty() {
-                        let result = BotCommand::parse(&message.text).and_then(|command| match command {
+                        let result = match assistant.handle(&message.text) {
+                            Ok(Some(reply)) => transport.send(owner_id, &reply),
+                            Err(error) => Err(error),
+                            Ok(None) => BotCommand::parse(&message.text).and_then(|command| match command {
                         BotCommand::Help => transport.send(owner_id, HELP),
                         BotCommand::Status => transport.send(owner_id, &state.subscription.as_ref().map(|s| format!("Мониторинг активен: {}\nСтраниц: {}, интервал: {} с", s.url, s.pages, s.interval)).unwrap_or_else(|| "Мониторинг остановлен. /help — команды".into())),
                         BotCommand::Stop => {
@@ -133,7 +175,8 @@ where
                             let result = perform_scan(&mut source, &mut make_source, repository, &search, pages)?;
                             transport.send(owner_id, &result)
                         }
-                    });
+                    }),
+                        };
                         if let Err(error) = result {
                             // Notification failures do not acknowledge the command: retry after reconnect.
                             if let Err(error) = transport.send(
