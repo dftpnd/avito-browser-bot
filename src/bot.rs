@@ -166,11 +166,13 @@ where
                             transport.send(owner_id, "Мониторинг остановлен.")
                         }
                         BotCommand::Watch { search, pages, interval } => {
+                            ensure!(assistant.allows_avito(),"Очередь Авито на паузе; /resume — продолжить");
                             state.subscription = Some(Subscription { url: search.as_str().into(), pages, interval, next_run: now() });
                             repository.save_bot_state(&state)?;
                             transport.send(owner_id, "Мониторинг включён. Начинаю первый проход.")
                         }
                         BotCommand::Scan { search, pages } => {
+                            ensure!(assistant.allows_avito(),"Очередь Авито на паузе; /resume — продолжить");
                             transport.send(owner_id, "Начинаю сканирование.")?;
                             let result = perform_scan(&mut source, &mut make_source, repository, &search, pages)?;
                             transport.send(owner_id, &result)
@@ -201,6 +203,9 @@ where
         }
         if !running.load(Ordering::SeqCst) {
             break;
+        }
+        if !assistant.allows_avito() {
+            continue;
         }
         if let Some(subscription) = state.subscription.clone().filter(|s| s.next_run <= now()) {
             let result = SearchUrl::parse(&subscription.url).and_then(|search| {

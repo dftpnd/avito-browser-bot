@@ -12,7 +12,14 @@ impl Store {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(serde_json::to_string(&rows)?)
+        let stable = rows
+            .into_iter()
+            .map(|(_, raw)| {
+                let value: serde_json::Value = serde_json::from_str(&raw)?;
+                super::sync::message_key(&value)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(serde_json::to_string(&stable)?)
     }
     pub fn draft_questions(&mut self, id: &str) -> Result<String> {
         let task = self.task()?;
@@ -77,6 +84,8 @@ impl Store {
                 )?;
             }
         }
+        self.db.execute("UPDATE outgoing_messages SET status='outdated' WHERE status='queued' AND draft_id IN (SELECT id FROM conversation_drafts WHERE status='outdated')",[])?;
+        self.db.execute("UPDATE work_jobs SET status='cancelled' WHERE status='queued' AND kind='dispatch' AND json_extract(payload,'$.outgoing_id') IN (SELECT id FROM outgoing_messages WHERE status='outdated')",[])?;
         Ok(changed)
     }
 }

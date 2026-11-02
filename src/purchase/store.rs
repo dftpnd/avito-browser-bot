@@ -19,6 +19,13 @@ impl Store {
         let db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(10))?;
         db.execute_batch("PRAGMA foreign_keys=ON;
+   CREATE TABLE IF NOT EXISTS work_jobs(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,payload TEXT NOT NULL,priority INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',available_at INTEGER NOT NULL,created INTEGER NOT NULL,error TEXT);
+   CREATE UNIQUE INDEX IF NOT EXISTS work_jobs_identity ON work_jobs(kind,payload);
+   CREATE TABLE IF NOT EXISTS work_settings(key TEXT PRIMARY KEY,payload TEXT NOT NULL);
+   CREATE TABLE IF NOT EXISTS chat_sync(chat_id TEXT PRIMARY KEY,complete INTEGER NOT NULL DEFAULT 0,last_synced INTEGER NOT NULL DEFAULT 0,head TEXT NOT NULL DEFAULT '[]');
+   CREATE TABLE IF NOT EXISTS outgoing_messages(id INTEGER PRIMARY KEY,draft_id INTEGER NOT NULL UNIQUE,chat_id TEXT NOT NULL,text TEXT NOT NULL,random_id TEXT NOT NULL UNIQUE,status TEXT NOT NULL,history_key TEXT NOT NULL,task_version INTEGER NOT NULL,created INTEGER NOT NULL,message_id TEXT);
+   CREATE UNIQUE INDEX IF NOT EXISTS outgoing_one_per_chat ON outgoing_messages(chat_id) WHERE status IN ('queued','dispatching','unknown','sent');
+   CREATE UNIQUE INDEX IF NOT EXISTS outgoing_one_writer ON outgoing_messages((1)) WHERE status='dispatching';
    CREATE TABLE IF NOT EXISTS trusted_sellers(id TEXT PRIMARY KEY,verified_at INTEGER NOT NULL);
    CREATE TABLE IF NOT EXISTS purchase_tasks(id INTEGER PRIMARY KEY,version INTEGER NOT NULL,payload TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS task_versions(task_id INTEGER NOT NULL,version INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(task_id,version));
@@ -26,6 +33,7 @@ impl Store {
    CREATE TABLE IF NOT EXISTS archived_messages(chat_id TEXT NOT NULL,message_id TEXT NOT NULL,payload TEXT NOT NULL,created REAL,observed_at INTEGER NOT NULL,PRIMARY KEY(chat_id,message_id));
    CREATE TABLE IF NOT EXISTS message_versions(chat_id TEXT NOT NULL,message_id TEXT NOT NULL,payload TEXT NOT NULL,observed_at INTEGER NOT NULL,PRIMARY KEY(chat_id,message_id,payload));
    CREATE TABLE IF NOT EXISTS archived_attachments(chat_id TEXT NOT NULL,message_id TEXT NOT NULL,reference TEXT NOT NULL,payload TEXT NOT NULL,local_path TEXT,status TEXT NOT NULL DEFAULT 'pending',PRIMARY KEY(chat_id,message_id,reference));
+   CREATE TABLE IF NOT EXISTS attachment_blobs(chat_id TEXT NOT NULL,message_id TEXT NOT NULL,reference TEXT NOT NULL,digest TEXT NOT NULL,path TEXT NOT NULL,mime TEXT NOT NULL,size INTEGER NOT NULL,downloaded_at INTEGER NOT NULL,PRIMARY KEY(chat_id,message_id,reference));
    CREATE TABLE IF NOT EXISTS offer_details(id TEXT PRIMARY KEY,payload TEXT NOT NULL,observed_at INTEGER NOT NULL);
    CREATE TABLE IF NOT EXISTS task_offers(task_id INTEGER NOT NULL,listing_id TEXT NOT NULL,chat_id TEXT,seller_id TEXT,PRIMARY KEY(task_id,listing_id));
    CREATE TABLE IF NOT EXISTS assessments(task_id INTEGER NOT NULL,listing_id TEXT NOT NULL,version INTEGER NOT NULL,assessment TEXT NOT NULL,verdict TEXT NOT NULL,input_key TEXT NOT NULL,observed_at INTEGER NOT NULL,PRIMARY KEY(task_id,listing_id));
@@ -38,6 +46,26 @@ impl Store {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
         Ok(Self { db })
+    }
+    pub fn ensure_task(&self) -> Result<()> {
+        let task = Task::gpu();
+        let payload = serde_json::to_string(&task)?;
+        self.db.execute(
+            "INSERT OR IGNORE INTO purchase_tasks VALUES(1,1,?1)",
+            [&payload],
+        )?;
+        self.db.execute("INSERT OR IGNORE INTO task_versions SELECT id,version,payload FROM purchase_tasks WHERE id=1",[])?;
+        Ok(())
+    }
+    pub fn set_task_pause(&self, paused: bool) -> Result<()> {
+        self.ensure_task()?;
+        let mut task = self.task()?;
+        task.paused = paused;
+        self.db.execute(
+            "UPDATE purchase_tasks SET payload=?1 WHERE id=1",
+            [serde_json::to_string(&task)?],
+        )?;
+        Ok(())
     }
     pub fn task(&self) -> Result<Task> {
         let payload: Option<String> = self
@@ -61,6 +89,15 @@ impl Store {
         tx.execute(
             "INSERT INTO task_versions VALUES(1,?1,?2)",
             params![task.version, payload],
+        )?;
+        tx.execute("UPDATE work_jobs SET status='cancelled' WHERE status='queued' AND kind IN ('search','detail','analyse','dispatch','open_chat')",[])?;
+        tx.execute(
+            "UPDATE outgoing_messages SET status='outdated' WHERE status='queued'",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE conversation_drafts SET status='outdated' WHERE status='draft'",
+            [],
         )?;
         tx.commit()?;
         Ok(task)

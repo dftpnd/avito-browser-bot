@@ -30,6 +30,9 @@ fn urls(value: &Value, output: &mut Vec<String>) {
 impl Store {
     pub fn import_archive(&mut self, path: &Path) -> Result<ImportSummary> {
         let root: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        self.import_records(&root)
+    }
+    pub fn import_records(&mut self, root: &Value) -> Result<ImportSummary> {
         let chats = root["chats"]
             .as_array()
             .context("Archive has no chats array")?;

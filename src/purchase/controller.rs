@@ -12,6 +12,9 @@ pub trait Assistant {
     fn handle(&mut self, text: &str) -> Result<Option<String>>;
     fn pending(&mut self) -> Result<Vec<(i64, String)>>;
     fn acknowledge(&mut self, id: i64) -> Result<()>;
+    fn allows_avito(&self) -> bool {
+        true
+    }
 }
 pub struct NoAssistant;
 impl Assistant for NoAssistant {
@@ -28,14 +31,27 @@ impl Assistant for NoAssistant {
 pub struct Controller {
     pub store: Store,
     model: Option<DeepSeek>,
+    messenger: Option<crate::adapters::messenger::Messenger>,
+    catalog: Option<crate::adapters::browser::BrowserSource>,
+    attachment_dir: std::path::PathBuf,
 }
 impl Controller {
     pub fn new(path: &Path) -> Result<Self> {
+        let store = Store::open(path)?;
+        store.ensure_task()?;
+        store.recover_work()?;
         Ok(Self {
-            store: Store::open(path)?,
+            store,
             model: None,
+            messenger: None,
+            catalog: None,
+            attachment_dir: path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("attachments"),
         })
     }
+
     fn listing_count(&self) -> Result<i64> {
         Ok(self
             .store
@@ -45,12 +61,28 @@ impl Controller {
     fn summary(&self) -> Result<String> {
         let task = self.store.task()?;
         let mut counts = [0; 4];
+        let mut seller_confirmed = 0;
         let mut stmt = self
             .store
             .db
-            .prepare("SELECT verdict FROM assessments WHERE task_id=1 AND version=?1")?;
-        for row in stmt.query_map([task.version], |r| r.get::<_, String>(0))? {
-            let v: Verdict = serde_json::from_str(&row?)?;
+            .prepare("SELECT verdict,assessment FROM assessments WHERE task_id=1 AND version=?1")?;
+        for row in stmt.query_map([task.version], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (raw, assessment) = row?;
+            let v: Verdict = serde_json::from_str(&raw)?;
+            let assessment: super::model::Assessment = serde_json::from_str(&assessment)?;
+            if v.status != Status::Rejected
+                && ["model", "availability"].iter().all(|key| {
+                    assessment.facts.get(*key).is_some_and(|f| {
+                        f.origin == Origin::Seller
+                            && !f.contradiction
+                            && now() - f.observed_at <= 86400
+                    })
+                })
+            {
+                seller_confirmed += 1;
+            }
             counts[match v.status {
                 Status::Candidate => 0,
                 Status::NeedsDetails => 1,
@@ -59,7 +91,7 @@ impl Controller {
             }] += 1;
         }
         Ok(format!(
-            "📊 {}\nТребования: v{}, {}\nВсего объявлений в базе: {}\nОценено для задачи: {}\nПолностью подходят: {}\nНужно уточнить: {}\nНе подходят: {}\n\nАрхив аккаунта (отдельно от задачи):\nДиалогов: {}\nСообщений: {}\nВложений с метаданными: {}\n\nСчётчики из локальной базы, не количество физических карт.",
+            "📊 {}\nТребования: v{}, {}\nВсего объявлений в базе: {}\nОценено для задачи: {}\nПредложение подтверждено продавцом: {}\nПолностью подходят: {}\nНужно уточнить: {}\nНе подходят: {}\n\nАрхив аккаунта (отдельно от задачи):\nДиалогов: {}\nСообщений: {}\nВложений с метаданными: {}\n\nСчётчики из локальной базы, не количество физических карт.",
             task.title,
             task.version,
             if task.approved {
@@ -69,6 +101,7 @@ impl Controller {
             },
             self.listing_count()?,
             counts.iter().sum::<i32>(),
+            seller_confirmed,
             counts[3],
             counts[1],
             counts[2],
@@ -90,9 +123,10 @@ impl Controller {
         })?;
         let mut results = vec![];
         for row in rows {
-            let (id, v, _, payload) = row?;
+            let (id, v, assessment, payload) = row?;
+            let assessment: super::model::Assessment = serde_json::from_str(&assessment)?;
             let v: Verdict = serde_json::from_str(&v)?;
-            if only_matches && v.status != Status::Matched {
+            if v.status == Status::Rejected || (only_matches && v.status != Status::Matched) {
                 continue;
             }
             let title = payload
@@ -100,13 +134,35 @@ impl Controller {
                 .and_then(|p| p["title"].as_str().map(str::to_owned))
                 .unwrap_or(id.clone());
             results.push((
-                v.tier,
+                (
+                    (v.status != Status::Matched) as u8,
+                    v.tier,
+                    assessment
+                        .facts
+                        .get("total_price_rub")
+                        .filter(|f| {
+                            f.origin == Origin::Seller
+                                && !f.contradiction
+                                && now() - f.observed_at <= 86400
+                        })
+                        .and_then(|f| f.value.as_i64())
+                        .unwrap_or(i64::MAX),
+                ),
                 format!(
-                    "{}\nID: {} · {:?} · группа {}\n{}",
+                    "{}\nОбъявление {} · {} · {}\n{}",
                     title,
                     id,
-                    v.status,
-                    v.tier,
+                    if v.status == Status::Matched {
+                        "Все обязательные условия подтверждены"
+                    } else {
+                        "Нужно уточнить"
+                    },
+                    match v.tier {
+                        1 => "в наличии",
+                        2 => "заказ без предоплаты",
+                        3 => "заказ с частичной предоплатой",
+                        _ => "условия не выяснены",
+                    },
                     v.reasons.join("; ")
                 ),
             ));
@@ -149,7 +205,7 @@ impl Controller {
         }];
         let linked:Option<(String,String)>=self.store.db.query_row("SELECT chat_id,seller_id FROM task_offers WHERE task_id=1 AND listing_id=?1 AND chat_id IS NOT NULL AND seller_id IS NOT NULL",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         if let Some((chat, seller)) = linked {
-            let mut stmt=self.store.db.prepare("SELECT payload FROM archived_messages WHERE chat_id=?1 ORDER BY created DESC LIMIT 30")?;
+            let mut stmt=self.store.db.prepare("SELECT payload FROM archived_messages WHERE chat_id=?1 ORDER BY created DESC, message_id DESC")?;
             let mut rows = stmt
                 .query_map([chat], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -172,7 +228,7 @@ impl Controller {
                                 Origin::Buyer
                             },
                             observed_at: m["created"].as_f64().unwrap_or(0.0) as i64,
-                            text: text.chars().take(2000).collect(),
+                            text,
                         });
                     }
                 }
@@ -226,6 +282,13 @@ impl Controller {
     }
 }
 impl Assistant for Controller {
+    fn allows_avito(&self) -> bool {
+        self.store
+            .setting("paused")
+            .map(|v| v != Some(true.into()))
+            .unwrap_or(false)
+            && self.store.task().is_ok_and(|t| !t.paused)
+    }
     fn handle(&mut self, text: &str) -> Result<Option<String>> {
         let text = text.trim();
         let (command, argument) = text.split_once(' ').unwrap_or((text, ""));
@@ -308,17 +371,107 @@ impl Assistant for Controller {
                 )
             }
             "/pause" | "⏸" => {
-                let mut t = self.store.task()?;
-                t.paused = true;
-                self.store.save_task(t)?;
-                "Задача приостановлена.".into()
+                self.store.set_setting("paused", true.into())?;
+                self.store.set_task_pause(true)?;
+                "Вся очередь Авито приостановлена. /resume — продолжить.".into()
+            }
+            "/resume" => {
+                self.store.set_setting("paused", false.into())?;
+                self.store.set_task_pause(false)?;
+                self.store.db.execute("UPDATE work_jobs SET status='queued',error=NULL WHERE status='error' AND kind!='dispatch'",[])?;
+                "Очередь продолжит работу после подтверждения прямого маршрута. Неопределённые отправки автоматически не повторяются.".into()
+            }
+            "/sync" => {
+                self.store.set_setting("monitor_dialogues", true.into())?;
+                if argument.trim().is_empty() {
+                    self.store.queue_sync()?;
+                } else {
+                    let exists: bool = self.store.db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM archived_chats WHERE id=?1)",
+                        [argument],
+                        |r| r.get(0),
+                    )?;
+                    ensure!(exists, "Диалог отсутствует в архиве");
+                    self.store.enqueue(
+                        super::jobs::Job::History {
+                            chat: argument.into(),
+                            before: None,
+                            cycle: now(),
+                        },
+                        80,
+                    )?;
+                }
+                "Синхронизация поставлена в очередь. /queue — прогресс.".into()
+            }
+            "/research" => {
+                let task = self.store.task()?;
+                ensure!(
+                    !task.searches.is_empty(),
+                    "Добавь запросы в требования задачи"
+                );
+                let pending:bool=self.store.db.query_row("SELECT EXISTS(SELECT 1 FROM work_jobs WHERE kind='search' AND status IN ('queued','running'))",[],|r|r.get(0))?;
+                ensure!(!pending, "Поиск уже в очереди");
+                self.store.set_task_pause(false)?;
+                for search in task.searches {
+                    self.store.enqueue(
+                        super::jobs::Job::Search {
+                            search,
+                            page: 1,
+                            limit: 10,
+                            version: task.version,
+                        },
+                        20,
+                    )?;
+                }
+                "Запросы поставлены в очередь. За один шаг просматривается одна страница, до 10 страниц на запрос. /queue — прогресс.".into()
+            }
+            "/queue" => self.store.sync_summary()?,
+            "/attachments" => format!(
+                "В очередь добавлено файлов: {} (до 50 за запуск). Приватные/устаревшие ссылки будут отмечены как недоступные.",
+                super::attachments::queue_pending(&self.store)?
+            ),
+            "/outreach" => {
+                ensure!(
+                    argument == "on" || argument == "off",
+                    "/outreach on или /outreach off"
+                );
+                if argument == "on" {
+                    ensure!(
+                        self.store.task()?.approved,
+                        "Сначала подтвердите требования"
+                    );
+                }
+                self.store
+                    .set_setting("outreach", (argument == "on").into())?;
+                if argument == "off" {
+                    self.store.db.execute(
+                        "UPDATE outgoing_messages SET status='cancelled' WHERE status='queued'",
+                        [],
+                    )?;
+                    self.store.db.execute("UPDATE conversation_drafts SET status='outdated' WHERE id IN (SELECT draft_id FROM outgoing_messages WHERE status='cancelled')",[])?;
+                    self.store.db.execute("UPDATE work_jobs SET status='cancelled' WHERE status='queued' AND kind IN ('dispatch','open_chat')",[])?;
+                }
+                "Режим последовательных уточнений обновлён. /queue — состояние.".into()
+            }
+            "/dismiss_send" => {
+                let id:i64=argument.parse().context("/dismiss_send ID — снять неопределённую отправку с автоматики после ручной проверки диалога")?;
+                let updated=self.store.db.execute("UPDATE outgoing_messages SET status='dismissed' WHERE id=?1 AND status='unknown'",[id])?;
+                ensure!(updated == 1, "Неопределённая операция не найдена");
+                "Операция снята с автоматики; сообщение не удалялось и повторно не отправлялось. Перед новым уточнением требуется свежая синхронизация диалога.".into()
+            }
+            "/send" => {
+                let id = self.store.queue_dispatch(argument)?;
+                format!(
+                    "Уточнение №{id} поставлено в очередь. Перед отправкой история будет проверена заново."
+                )
             }
             "/network" | "🛠" => {
                 let audit = crate::adapters::network::audit()?;
                 format!(
-                    "Прямой маршрут Авито: {}\n{}\nОценок DeepSeek: {}",
+                    "Прямой маршрут Авито: {}\n{}\n\n{}\nОценок DeepSeek: {}",
                     audit.direct,
                     audit.reasons.join("\n"),
+                    self.store.sync_summary()?,
                     self.store.count("model_usage")?
                 )
             }
@@ -492,8 +645,9 @@ impl Assistant for Controller {
         Ok(Some(response.chars().take(3900).collect()))
     }
     fn pending(&mut self) -> Result<Vec<(i64, String)>> {
-        self.store.recalculate()?;
         self.store.invalidate_drafts()?;
+        self.work_step()?;
+        self.store.recalculate()?;
         self.store.pending()
     }
     fn acknowledge(&mut self, id: i64) -> Result<()> {
@@ -501,9 +655,227 @@ impl Assistant for Controller {
     }
 }
 
+impl Controller {
+    fn work_step(&mut self) -> Result<()> {
+        use super::jobs::{CatalogSource, Job};
+        let lease = match self.store.claim(&super::jobs::DirectPolicy) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.store
+                    .set_setting("network_blocked", error.to_string().into())?;
+                return Ok(());
+            }
+        };
+        let Some(lease) = lease else { return Ok(()) };
+        let result = (|| -> Result<()> {
+            match &lease.job {
+                Job::Attachment {
+                    chat,
+                    message,
+                    reference,
+                } => {
+                    let mut source = super::attachments::HttpAttachments::new()?;
+                    super::attachments::save(
+                        &self.store,
+                        chat,
+                        message,
+                        reference,
+                        &self.attachment_dir,
+                        &mut source,
+                    )?;
+                }
+                Job::Chats { .. } | Job::History { .. } => {
+                    if self.messenger.is_none() {
+                        self.messenger = Some(crate::adapters::messenger::Messenger::connect()?);
+                    }
+                    super::jobs::perform_read(
+                        &mut self.store,
+                        &lease.job,
+                        self.messenger.as_mut().unwrap(),
+                    )?;
+                }
+                Job::OpenChat { listing_id } => {
+                    ensure!(
+                        self.store.task()?.approved && !self.store.task()?.paused,
+                        "Требования не подтверждены или задача остановлена"
+                    );
+                    ensure!(
+                        self.store.setting("outreach")? == Some(true.into()),
+                        "Уточнения продавцам отключены"
+                    );
+                    if self.messenger.is_none() {
+                        self.messenger = Some(crate::adapters::messenger::Messenger::connect()?);
+                    }
+                    use super::sync::ConversationSource;
+                    let chat = self
+                        .messenger
+                        .as_mut()
+                        .unwrap()
+                        .open_for_listing(listing_id)?;
+                    self.store.db.execute("INSERT INTO task_offers(task_id,listing_id,chat_id) VALUES(1,?1,?2) ON CONFLICT(task_id,listing_id) DO UPDATE SET chat_id=excluded.chat_id",params![listing_id,chat])?;
+                    self.store.enqueue(
+                        Job::Chats {
+                            before: None,
+                            cycle: now(),
+                        },
+                        90,
+                    )?;
+                }
+                Job::Dispatch { outgoing_id } => {
+                    if self.messenger.is_none() {
+                        self.messenger = Some(crate::adapters::messenger::Messenger::connect()?);
+                    }
+                    super::jobs::perform_dispatch(
+                        &mut self.store,
+                        *outgoing_id,
+                        self.messenger.as_mut().unwrap(),
+                    )?;
+                }
+                Job::Search {
+                    search,
+                    page,
+                    limit,
+                    version,
+                } => {
+                    ensure!(
+                        self.store.task()?.version == *version,
+                        "Требования изменились; запусти поиск заново"
+                    );
+                    if self.catalog.is_none() {
+                        self.catalog = Some(crate::adapters::browser::BrowserSource::connect(
+                            std::time::Duration::from_secs(20),
+                        )?);
+                    }
+                    let (items, has_more) =
+                        self.catalog.as_mut().unwrap().search_page(search, *page)?;
+
+                    for listing in items {
+                        listing.validate()?;
+                        let existing:bool=self.store.db.query_row("SELECT EXISTS(SELECT 1 FROM task_offers WHERE task_id=1 AND listing_id=?1)",[&listing.id],|r|r.get(0))?;
+                        self.store.db.execute("INSERT INTO listings(id,payload,first_seen,last_seen) VALUES(?1,?2,?3,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,last_seen=excluded.last_seen",params![listing.id,serde_json::to_string(&listing)?,now()])?;
+                        self.store.db.execute(
+                            "INSERT OR IGNORE INTO task_offers(task_id,listing_id) VALUES(1,?1)",
+                            [&listing.id],
+                        )?;
+                        let fresh:bool=self.store.db.query_row("SELECT EXISTS(SELECT 1 FROM offer_details WHERE id=?1 AND observed_at>?2)",params![listing.id,now()-86400],|r|r.get(0))?;
+                        if !existing || !fresh {
+                            self.store.enqueue(
+                                Job::Detail {
+                                    listing_id: listing.id,
+                                },
+                                10,
+                            )?;
+                        }
+                    }
+                    if has_more && page < limit {
+                        self.store.enqueue(
+                            Job::Search {
+                                search: search.clone(),
+                                page: page + 1,
+                                limit: *limit,
+                                version: *version,
+                            },
+                            20,
+                        )?;
+                    }
+                }
+                Job::Detail { listing_id } => {
+                    let raw: String = self.store.db.query_row(
+                        "SELECT payload FROM listings WHERE id=?1",
+                        [listing_id],
+                        |r| r.get(0),
+                    )?;
+                    let listing: crate::domain::Listing = serde_json::from_str(&raw)?;
+                    if self.catalog.is_none() {
+                        self.catalog = Some(crate::adapters::browser::BrowserSource::connect(
+                            std::time::Duration::from_secs(20),
+                        )?);
+                    }
+                    let detail = self
+                        .catalog
+                        .as_mut()
+                        .unwrap()
+                        .detail(&listing.id, &listing.url)?;
+                    self.store.db.execute("INSERT INTO offer_details VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,observed_at=excluded.observed_at",params![listing.id,detail.to_string(),now()])?;
+                    self.store.enqueue(
+                        Job::Analyse {
+                            listing_id: listing.id,
+                        },
+                        25,
+                    )?;
+                }
+                Job::Analyse { listing_id } => {
+                    self.analyse(listing_id)?;
+                    if self.store.setting("outreach")? == Some(true.into())
+                        && self.store.task()?.approved
+                        && !self.store.task()?.paused
+                    {
+                        // A linked fully synchronized conversation is required; incomplete ones wait.
+                        let ready:bool=self.store.db.query_row("SELECT EXISTS(SELECT 1 FROM task_offers o JOIN chat_sync s ON s.chat_id=o.chat_id WHERE o.listing_id=?1 AND o.seller_id IS NOT NULL AND s.complete=1 AND s.last_synced>?2)",params![listing_id,now()-300],|r|r.get(0))?;
+                        let linked:bool=self.store.db.query_row("SELECT EXISTS(SELECT 1 FROM task_offers WHERE task_id=1 AND listing_id=?1 AND chat_id IS NOT NULL)",[listing_id],|r|r.get(0))?;
+                        let rejected:bool=self.store.db.query_row("SELECT json_extract(verdict,'$.status')='rejected' FROM assessments WHERE task_id=1 AND listing_id=?1",[listing_id],|r|r.get(0))?;
+                        if !linked && !rejected {
+                            self.store.enqueue(
+                                Job::OpenChat {
+                                    listing_id: listing_id.clone(),
+                                },
+                                30,
+                            )?;
+                        }
+                        if ready && self.store.draft_questions(listing_id).is_ok() {
+                            let _ = self.store.queue_dispatch(listing_id);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.store.finish(lease.id)?,
+            Err(error) => {
+                self.store.defer_failure(lease.id, &error.to_string())?;
+                self.messenger = None;
+                self.catalog = None;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disabling_outreach_cancels_waiting_dispatches_without_sending() {
+        let dir = std::env::temp_dir().join(format!("avito-outreach-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.sqlite");
+        let base = crate::adapters::sqlite::SqliteRepository::open(&path).unwrap();
+        let mut controller = Controller::new(&path).unwrap();
+        controller.store.db.execute("INSERT INTO conversation_drafts VALUES(1,1,'123','chat',1,'history','question','draft',0)",[]).unwrap();
+        controller.store.db.execute("INSERT INTO outgoing_messages(draft_id,chat_id,text,random_id,status,history_key,task_version,created) VALUES(1,'chat','question','random','queued','history',1,0)",[]).unwrap();
+        controller
+            .store
+            .enqueue(super::super::jobs::Job::Dispatch { outgoing_id: 1 }, 70)
+            .unwrap();
+        controller.handle("/outreach off").unwrap();
+        let status: String = controller
+            .store
+            .db
+            .query_row("SELECT status FROM outgoing_messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        let status: String = controller
+            .store
+            .db
+            .query_row("SELECT status FROM work_jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        assert!(controller.messenger.is_none());
+        drop(controller);
+        drop(base);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn buttons_use_local_data_and_history_does_not_echo_credentials() {
         let dir = std::env::temp_dir().join(format!("avito-controller-{}", std::process::id()));

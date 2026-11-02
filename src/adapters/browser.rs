@@ -27,12 +27,12 @@ pub struct BrowserSource {
     page_delay: Duration,
 }
 
-struct Cdp {
+pub(crate) struct Cdp {
     socket: WebSocket<TcpStream>,
     next_id: u64,
 }
 impl Cdp {
-    fn connect(address: &str) -> Result<Self> {
+    pub(crate) fn connect(address: &str) -> Result<Self> {
         let url = url::Url::parse(address)?;
         ensure!(
             url.scheme() == "ws" && url.host_str() == Some("127.0.0.1") && url.port() == Some(9222),
@@ -46,7 +46,7 @@ impl Cdp {
             client(address, socket).map_err(|e| anyhow::anyhow!("CDP handshake failed: {e}"))?;
         Ok(Self { socket, next_id: 0 })
     }
-    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+    pub(crate) fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.next_id += 1;
         let id = self.next_id;
         self.socket.send(Message::Text(
@@ -72,7 +72,7 @@ impl Cdp {
             }
         }
     }
-    fn evaluate(&mut self, expression: &str) -> Result<Value> {
+    pub(crate) fn evaluate(&mut self, expression: &str) -> Result<Value> {
         let result = self.call(
             "Runtime.evaluate",
             json!({"expression":expression,"returnByValue":true,"awaitPromise":true}),
@@ -244,7 +244,7 @@ impl Drop for BrowserSource {
     }
 }
 
-fn verify_profile() -> Result<()> {
+pub(crate) fn verify_profile() -> Result<()> {
     // Do not silently attach to another Chrome or a different signed-in profile.
     let found = std::fs::read_dir("/proc")?
         .filter_map(Result::ok)
@@ -315,9 +315,66 @@ impl BrowserSource {
     }
 }
 
+impl crate::purchase::jobs::CatalogSource for BrowserSource {
+    fn search_page(&mut self, url: &str, page: u32) -> Result<(Vec<Listing>, bool)> {
+        let search = SearchUrl::parse(url)?;
+        let data = self.load(&search.page(page))?;
+        Ok((data.items, data.next.is_some()))
+    }
+    fn detail(&mut self, id: &str, url: &str) -> Result<Value> {
+        self.describe(&Listing {
+            id: id.into(),
+            title: "Карточка".into(),
+            url: url.into(),
+            price: None,
+            location: String::new(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires existing Snap Chromium; all messenger calls are local fakes in a new blank tab"]
+    fn changed_message_body_prevents_send_in_javascript() {
+        use crate::purchase::sync::{DispatchResult, SendIntent, message_key};
+        let mut source = BrowserSource::connect(Duration::ZERO).unwrap();
+        let original = json!({"id":"1","body":{"text":"old"},"fromUid":"seller","type":"text","created":1,"isDeleted":false});
+        let intent = SendIntent {
+            chat_id: "fake-chat".into(),
+            text: "question".into(),
+            random_id: "fake-random".into(),
+            expected_head: vec![message_key(&original).unwrap()],
+        };
+        source.page.evaluate(&format!("window.__head=[{}];window.__calls=0;window.__avitoAssistant={{client:{{request:async()=>({{result:{{items:window.__head}}}})}},store:{{getState:()=>({{}})}}}};window.__avitoAssistantRequire=()=>({{W:async()=>{{window.__calls++;return {{result:{{id:'sent-fake'}}}}}}}})",original)).unwrap();
+        source
+            .page
+            .evaluate("window.__head[0].body.text='manual edit'")
+            .unwrap();
+        let result = source
+            .page
+            .evaluate(&super::super::messenger::conditional_send_script(&intent).unwrap())
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_value::<DispatchResult>(result).unwrap(),
+            DispatchResult::Changed { .. }
+        ));
+        assert_eq!(source.page.evaluate("window.__calls").unwrap(), json!(0));
+        source
+            .page
+            .evaluate("window.__head[0].body.text='old'")
+            .unwrap();
+        let result = source
+            .page
+            .evaluate(&super::super::messenger::conditional_send_script(&intent).unwrap())
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_value::<DispatchResult>(result).unwrap(),
+            DispatchResult::Sent { .. }
+        ));
+        assert_eq!(source.page.evaluate("window.__calls").unwrap(), json!(1));
+    }
     #[test]
     #[ignore = "requires the running authorized Snap Chromium; touches only a new fixture tab"]
     fn extracts_fixture_and_detects_blocking_in_real_chromium() {

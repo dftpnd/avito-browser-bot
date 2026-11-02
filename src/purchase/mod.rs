@@ -1,7 +1,10 @@
 pub mod archive;
+pub mod attachments;
 pub mod controller;
 pub mod deepseek;
 pub mod dialogue;
+pub mod jobs;
 pub mod model;
 pub mod privacy;
 pub mod store;
+pub mod sync;
