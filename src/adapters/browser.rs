@@ -1,0 +1,321 @@
+use crate::{
+    domain::{Listing, SearchUrl},
+    ports::ListingSource,
+};
+use anyhow::{Context, Result, bail, ensure};
+use reqwest::blocking::Client;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::{
+    collections::HashSet,
+    net::TcpStream,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
+use tungstenite::{Message, WebSocket, client};
+
+const CDP: &str = "http://127.0.0.1:9222";
+const PROFILE: &str = "/home/mg/kinobot/chrome-profile";
+const EXTRACT: &str = include_str!("extract.js");
+
+/// This adapter owns only the tab it creates; it never closes the browser.
+pub struct BrowserSource {
+    browser: Cdp,
+    page: Cdp,
+    target: String,
+    page_delay: Duration,
+}
+
+struct Cdp {
+    socket: WebSocket<TcpStream>,
+    next_id: u64,
+}
+impl Cdp {
+    fn connect(address: &str) -> Result<Self> {
+        let url = url::Url::parse(address)?;
+        ensure!(
+            url.scheme() == "ws" && url.host_str() == Some("127.0.0.1") && url.port() == Some(9222),
+            "Unexpected CDP websocket address"
+        );
+        let socket =
+            TcpStream::connect_timeout(&"127.0.0.1:9222".parse()?, Duration::from_secs(5))?;
+        socket.set_read_timeout(Some(Duration::from_secs(15)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(15)))?;
+        let (socket, _) =
+            client(address, socket).map_err(|e| anyhow::anyhow!("CDP handshake failed: {e}"))?;
+        Ok(Self { socket, next_id: 0 })
+    }
+    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.socket.send(Message::Text(
+            json!({"id":id,"method":method,"params":params})
+                .to_string()
+                .into(),
+        ))?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            ensure!(Instant::now() < deadline, "CDP command timed out: {method}");
+            match self.socket.read()? {
+                Message::Text(value) => {
+                    let message: Value = serde_json::from_str(&value)?;
+                    if message["id"].as_u64() == Some(id) {
+                        if let Some(error) = message.get("error") {
+                            bail!("CDP {method}: {error}");
+                        }
+                        return Ok(message["result"].clone());
+                    }
+                }
+                Message::Close(_) => bail!("Browser closed the CDP connection"),
+                _ => {}
+            }
+        }
+    }
+    fn evaluate(&mut self, expression: &str) -> Result<Value> {
+        let result = self.call(
+            "Runtime.evaluate",
+            json!({"expression":expression,"returnByValue":true,"awaitPromise":true}),
+        )?;
+        ensure!(
+            result.get("exceptionDetails").is_none(),
+            "Page evaluation failed: {}",
+            result["exceptionDetails"]
+        );
+        Ok(result["result"]["value"].clone())
+    }
+}
+
+#[derive(Deserialize)]
+struct PageData {
+    state: String,
+    items: Vec<Listing>,
+    next: Option<String>,
+}
+
+impl BrowserSource {
+    pub fn connect(page_delay: Duration) -> Result<Self> {
+        verify_profile()?;
+        let http = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let version: Value = http
+            .get(format!("{CDP}/json/version"))
+            .send()
+            .context("Chromium CDP unavailable; start the browser as described in README.md")?
+            .error_for_status()?
+            .json()?;
+        let mut browser = Cdp::connect(
+            version["webSocketDebuggerUrl"]
+                .as_str()
+                .context("No browser websocket")?,
+        )?;
+        let target = browser.call(
+            "Target.createTarget",
+            json!({"url":"about:blank","background":true}),
+        )?["targetId"]
+            .as_str()
+            .context("No target ID")?
+            .to_owned();
+        let attach = (|| -> Result<Cdp> {
+            let pages: Vec<Value> = http
+                .get(format!("{CDP}/json/list"))
+                .send()?
+                .error_for_status()?
+                .json()?;
+            let page = pages
+                .iter()
+                .find(|p| p["id"].as_str() == Some(&target))
+                .context("Created tab not found")?;
+            Cdp::connect(
+                page["webSocketDebuggerUrl"]
+                    .as_str()
+                    .context("No page websocket")?,
+            )
+        })();
+        match attach {
+            Ok(page) => Ok(Self {
+                browser,
+                page,
+                target,
+                page_delay,
+            }),
+            Err(error) => {
+                let _ = browser.call("Target.closeTarget", json!({"targetId":target}));
+                Err(error)
+            }
+        }
+    }
+
+    fn load(&mut self, url: &str) -> Result<PageData> {
+        let result = self.page.call("Page.navigate", json!({"url":url}))?;
+        ensure!(
+            result.get("errorText").is_none(),
+            "Navigation failed: {}",
+            result["errorText"]
+        );
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut last_items = None;
+        let mut stable_since = Instant::now();
+        loop {
+            thread::sleep(Duration::from_millis(750));
+            // Page.navigate returns before the new document is installed. Never read old cards.
+            let current = self.page.evaluate("location.href")?;
+            if current.as_str() == Some(url) {
+                let data: PageData = serde_json::from_value(self.page.evaluate(EXTRACT)?)?;
+                match data.state.as_str() {
+                    "blocked" => bail!(
+                        "Avito requests verification or has restricted access. Resolve it in the browser; automatic scanning stopped"
+                    ),
+                    "login" => bail!("Avito requests login; sign in manually in Chromium"),
+                    "ready" | "empty" => {
+                        if last_items.as_ref() != Some(&data.items) {
+                            stable_since = Instant::now();
+                        }
+                        if last_items.as_ref() == Some(&data.items)
+                            && stable_since.elapsed() >= Duration::from_secs(2)
+                        {
+                            return Ok(data);
+                        }
+                        last_items = Some(data.items);
+                    }
+                    _ => {
+                        last_items = None;
+                    }
+                }
+            } else if current
+                .as_str()
+                .is_some_and(|s| s.contains("/login") || s.contains("/registration"))
+            {
+                bail!("Avito requests login; sign in manually in Chromium");
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "Search did not load or redirected to a different URL; no successful scan recorded"
+            );
+        }
+    }
+}
+
+impl ListingSource for BrowserSource {
+    fn collect(&mut self, search: &SearchUrl, max_pages: u32) -> Result<Vec<Listing>> {
+        ensure!(max_pages > 0, "Page limit must be positive");
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
+        for number in 1..=max_pages {
+            if number > 1 {
+                thread::sleep(self.page_delay);
+            }
+            let data = self.load(&search.page(number))?;
+            let mut added = 0;
+            for listing in data.items {
+                listing.validate()?;
+                if seen.insert(listing.id.clone()) {
+                    added += 1;
+                    items.push(listing);
+                }
+            }
+            if added == 0 || data.next.is_none() {
+                break;
+            }
+        }
+        Ok(items)
+    }
+}
+
+impl Drop for BrowserSource {
+    fn drop(&mut self) {
+        let _ = self
+            .browser
+            .call("Target.closeTarget", json!({"targetId": self.target}));
+    }
+}
+
+fn verify_profile() -> Result<()> {
+    // Do not silently attach to another Chrome or a different signed-in profile.
+    let found = std::fs::read_dir("/proc")?
+        .filter_map(Result::ok)
+        .any(|entry| {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+            {
+                return false;
+            }
+            let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) else {
+                return false;
+            };
+            let raw_args: Vec<_> = bytes
+                .split(|b| *b == 0)
+                .filter_map(|b| std::str::from_utf8(b).ok())
+                .collect();
+            // Snap can expose the full command as a single argv entry in /proc.
+            let args: Vec<&str> = if raw_args.len() <= 2 {
+                raw_args
+                    .first()
+                    .copied()
+                    .unwrap_or("")
+                    .split_ascii_whitespace()
+                    .collect()
+            } else {
+                raw_args
+            };
+            args.iter()
+                .any(|a| a.starts_with("/snap/chromium/") || *a == "/snap/bin/chromium")
+                && args.contains(&format!("--user-data-dir={PROFILE}").as_str())
+                && args.contains(&"--remote-debugging-port=9222")
+                && !args.iter().any(|a| a.starts_with("--type="))
+        });
+    ensure!(
+        found && Path::new(PROFILE).is_dir(),
+        "Expected Snap Chromium profile is not running. Start it using README.md; the bot will not substitute another browser"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires the running authorized Snap Chromium; touches only a new fixture tab"]
+    fn extracts_fixture_and_detects_blocking_in_real_chromium() {
+        let mut source = BrowserSource::connect(Duration::ZERO).unwrap();
+        source.page.call("Page.enable", json!({})).unwrap();
+        let frame = source.page.call("Page.getFrameTree", json!({})).unwrap()["frameTree"]["frame"]
+            ["id"]
+            .clone();
+        source
+            .page
+            .call(
+                "Page.setDocumentContent",
+                json!({"frameId": frame, "html": include_str!("../../tests/fixtures/search.html")}),
+            )
+            .unwrap();
+        let data: PageData =
+            serde_json::from_value(source.page.evaluate(EXTRACT).unwrap()).unwrap();
+        assert_eq!(data.state, "ready");
+        assert_eq!(data.items.len(), 2);
+        assert_eq!(data.items[0].id, "123456789");
+        assert_eq!(data.items[0].price, Some(42900));
+        assert_eq!(data.items[1].price, Some(0));
+        assert!(!data.items[0].url.contains('?'));
+        assert!(data.next.is_some());
+        source
+            .page
+            .evaluate("document.body.innerHTML = '<h1>Доступ ограничен</h1>'")
+            .unwrap();
+        let data: PageData =
+            serde_json::from_value(source.page.evaluate(EXTRACT).unwrap()).unwrap();
+        assert_eq!(data.state, "blocked");
+        source
+            .page
+            .evaluate("document.body.innerHTML = '<p>Ничего не найдено</p>'")
+            .unwrap();
+        let data: PageData =
+            serde_json::from_value(source.page.evaluate(EXTRACT).unwrap()).unwrap();
+        assert_eq!(data.state, "empty");
+    }
+}

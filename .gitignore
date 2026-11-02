@@ -1,0 +1,25 @@
+avito-export*/
+avito-export*.zip
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+chrome-profile/
+chromium-profile/
+
+# Bot runtime and personal configuration
+/target/
+/data/
+/config.local.*
+*.sqlite*
+*.db
+*.db-*
+*.log
+*.zip
+*.pem
+*.key
+cookies*
+/README.local.md
+# Legacy local correspondence utility
+/export_avito.py
