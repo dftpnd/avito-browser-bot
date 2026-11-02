@@ -11,7 +11,7 @@ spec.loader.exec_module(module)
 class DirectRouteTest(unittest.TestCase):
     def config(self):
         return {
-            'inbounds': [{'protocol': 'dokodemo-door', 'sniffing': {
+            'inbounds': [{'protocol': 'dokodemo-door', 'settings': {'followRedirect': True}, 'sniffing': {
                 'enabled': True, 'destOverride': ['http', 'tls', 'quic']}}],
             'outbounds': [{'tag': 'existing-vpn', 'protocol': 'vless', 'settings': {'unchanged': True}}],
             'routing': {'rules': [{'type': 'field', 'domain': ['example.org'], 'outboundTag': 'existing-vpn'}]},
@@ -38,6 +38,11 @@ class DirectRouteTest(unittest.TestCase):
         ]:
             with self.assertRaises(RuntimeError):
                 module.prepare(invalid)
+
+    def test_fixed_dns_inbound_does_not_require_browser_sniffing(self):
+        config = self.config()
+        config['inbounds'].append({'protocol': 'dokodemo-door', 'settings': {'address': '1.1.1.1', 'port': 53}})
+        module.expected(module.prepare(config))
 
     def test_direct_redirect_is_not_accepted(self):
         config = module.prepare(self.config())

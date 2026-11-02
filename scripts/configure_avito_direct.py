@@ -31,7 +31,9 @@ def inspect(config):
         raise RuntimeError('Custom routing script exists; manual review required, nothing changed')
     # Domain routing is not sufficient for transparent TLS unless names are sniffed.
     transparent = [i for i in config.get('inbounds', [])
-                   if i.get('protocol') == 'dokodemo-door']
+                   if i.get('protocol') == 'dokodemo-door'
+                   and (i.get('settings', {}).get('followRedirect')
+                        or i.get('streamSettings', {}).get('sockopt', {}).get('tproxy') in ('tproxy', 'redirect'))]
     if not transparent:
         raise RuntimeError('No recognized transparent inbound; manual review required')
     for inbound in transparent:
