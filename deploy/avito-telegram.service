@@ -1,0 +1,17 @@
+[Unit]
+Description=Avito Telegram monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/avito
+ExecStart=%h/projects/avito/target/release/avito-browser-bot telegram --config %h/projects/avito/config.local.json
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=180
+KillSignal=SIGINT
+UMask=0077
+
+[Install]
+WantedBy=default.target

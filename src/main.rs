@@ -1,6 +1,11 @@
 use anyhow::{Result, ensure};
 use avito_browser_bot::{
-    adapters::{browser::BrowserSource, report, sqlite::SqliteRepository},
+    adapters::{
+        browser::BrowserSource,
+        report,
+        sqlite::SqliteRepository,
+        telegram::{TelegramClient, TelegramConfig},
+    },
     application,
     domain::SearchUrl,
     ports::ListingRepository,
@@ -27,6 +32,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Telegram-бот: команды и уведомления только владельцу
+    Telegram {
+        #[arg(long, default_value = "config.local.json")]
+        config: PathBuf,
+    },
+    /// Проверить API и показать ID отправителей /start, без отправки сообщений
+    TelegramSetup {
+        #[arg(long, default_value = "config.local.json")]
+        config: PathBuf,
+    },
     /// Один проход по готовой ссылке поиска
     Scan {
         url: String,
@@ -59,6 +74,38 @@ fn main() -> Result<()> {
     };
     let mut repository = SqliteRepository::open(&cli.database)?;
     match cli.command {
+        Command::TelegramSetup { config } => {
+            let config = TelegramConfig::load(&config)?;
+            let transport = TelegramClient::new(config.token)?;
+            eprintln!("Bot: @{}", transport.check()?);
+            for candidate in transport.candidates()? {
+                if candidate.private && candidate.text.split_whitespace().next() == Some("/start") {
+                    println!("Private /start: owner_id={}", candidate.user_id);
+                }
+            }
+        }
+        Command::Telegram { config } => {
+            let config = TelegramConfig::load(&config)?;
+            let owner_id = config.owner_id.filter(|id| *id > 0).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Set verified owner_id in local config; use telegram-setup after sending /start"
+                )
+            })?;
+            let mut transport = TelegramClient::new(config.token)?;
+            eprintln!("Bot: @{}", transport.check()?);
+            let running = Arc::new(AtomicBool::new(true));
+            let signal = running.clone();
+            ctrlc::set_handler(move || {
+                signal.store(false, Ordering::SeqCst);
+            })?;
+            avito_browser_bot::bot::run(
+                &mut transport,
+                &mut repository,
+                owner_id,
+                || BrowserSource::connect(Duration::from_secs(5)),
+                running,
+            )?;
+        }
         Command::List => println!("{}", serde_json::to_string_pretty(&repository.listings()?)?),
         Command::Report { output } => {
             protect_database(&output, &cli.database)?;

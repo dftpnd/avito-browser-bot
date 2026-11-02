@@ -20,6 +20,7 @@ impl SqliteRepository {
     fn from_connection(conn: Connection) -> Result<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS listings (
                 id TEXT PRIMARY KEY, payload TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS search_listings (
@@ -179,5 +180,88 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+}
+
+impl crate::ports::BotRepository for SqliteRepository {
+    fn bot_state(&self) -> Result<Option<crate::domain::bot::BotState>> {
+        let value: Option<String> = self
+            .conn
+            .query_row("SELECT payload FROM bot_state WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
+    }
+    fn save_bot_state(&mut self, state: &crate::domain::bot::BotState) -> Result<()> {
+        self.conn.execute("INSERT INTO bot_state(id,payload) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", [serde_json::to_string(state)?])?;
+        Ok(())
+    }
+    fn latest_change_id(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id),0) FROM changes", [], |row| {
+                row.get(0)
+            })?)
+    }
+    fn changes_after(&self, after: i64, limit: u32) -> Result<Vec<(i64, Change)>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT id,payload FROM changes WHERE id>?1 ORDER BY id LIMIT ?2")?;
+        let rows = statement.query_map(params![after, limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (id, payload) = row?;
+            Ok((id, serde_json::from_str(&payload)?))
+        })
+        .collect()
+    }
+}
+
+#[cfg(test)]
+mod bot_tests {
+    use super::*;
+    use crate::{
+        domain::bot::{BotState, Subscription},
+        ports::BotRepository,
+    };
+    #[test]
+    fn resumes_bot_state_and_reads_durable_changes() {
+        let mut store =
+            SqliteRepository::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let state = BotState {
+            owner_id: 42,
+            offset: 7,
+            change_cursor: 0,
+            subscription: Some(Subscription {
+                url: "https://avito.ru/moskva".into(),
+                pages: 2,
+                interval: 300,
+                next_run: 123,
+            }),
+        };
+        store.save_bot_state(&state).unwrap();
+        let loaded = store.bot_state().unwrap().unwrap();
+        assert_eq!(loaded.offset, 7);
+        assert_eq!(loaded.subscription.unwrap().next_run, 123);
+        let listing = Listing {
+            id: "123".into(),
+            title: "Test".into(),
+            url: "https://avito.ru/moskva/test_123".into(),
+            price: Some(100),
+            location: "Москва".into(),
+        };
+        store
+            .record_scan(
+                &SearchUrl::parse("https://avito.ru/moskva").unwrap(),
+                &[listing],
+                1,
+            )
+            .unwrap();
+        let changes = store.changes_after(0, 20).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].1.kind, ChangeKind::New);
+        assert!(store.changes_after(changes[0].0, 20).unwrap().is_empty());
     }
 }

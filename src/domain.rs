@@ -140,3 +140,5 @@ mod tests {
         }
     }
 }
+
+pub mod bot;
